@@ -180,6 +180,11 @@ init([{SockMod, Socket}, Opts]) ->
                  true -> verify_peer;
                  false -> verify_none
              end,
+    HibernateAfter =
+        case lists:keyfind(hibernate_after, 1, Opts) of
+            {_, HA} -> HA;
+            _ -> 0
+        end,
     StartTLS = lists:member(starttls, Opts) orelse Verify =:= verify_peer,
     StartTLSRequired = lists:member(starttls_required, Opts),
     TLSEnabled = lists:member(tls, Opts),
@@ -225,7 +230,8 @@ init([{SockMod, Socket}, Opts]) ->
                                          access         = Access,
                                          shaper         = Shaper,
                                          ip             = IP,
-                                         lang           = default_language()},
+                                         lang           = default_language(),
+                                         hibernate_after= HibernateAfter},
              ?C2S_OPEN_TIMEOUT}
     end.
 
@@ -878,7 +884,8 @@ do_open_session(Acc, JID, StateData) ->
                 {stop, normal, NextStateData} -> % error, resume not possible
                     c2s_stream_error(mongoose_xmpp_errors:stream_internal_server_error(), NextStateData),
                     {stop, Acc1, NStateData};
-                {_, _, NextStateData, _} ->
+                Result when is_tuple(Result) ->
+                    NextStateData = element(3, Result),
                     do_open_session_common(Acc1, JID, NextStateData)
             end
     end.
@@ -993,11 +1000,7 @@ session_established({xmlstreamelement, El}, StateData) ->
 %% We hibernate the process to reduce memory consumption after a
 %% configurable activity timeout
 session_established(timeout, StateData) ->
-    %% TODO: Options must be stored in state:
-    Options = [],
-    proc_lib:hibernate(p1_fsm_old, enter_loop,
-                       [?MODULE, Options, session_established, StateData]),
-    fsm_next_state(session_established, StateData);
+    hibernate({next_state, session_established, StateData});
 session_established({xmlstreamend, _Name}, StateData) ->
     send_trailer(StateData),
     {stop, normal, StateData};
@@ -1094,18 +1097,18 @@ resume_session({xmlstreamelement, _}, StateData) ->
                                 <<"session in resume state cannot accept incoming stanzas">>),
     maybe_send_element_safe(StateData, Err),
     maybe_send_trailer_safe(StateData),
-    {next_state, resume_session, StateData, hibernate};
+    hibernate({next_state, resume_session, StateData});
 
 %%-------------------------------------------------------------------------
 %% ignore mod_ping closed messages because we are already in resume session
 %% state
 resume_session(closed, StateData) ->
-    {next_state, resume_session, StateData, hibernate};
+    hibernate({next_state, resume_session, StateData});
 resume_session(timeout, StateData) ->
-    {next_state, resume_session, StateData, hibernate};
+    hibernate({next_state, resume_session, StateData});
 resume_session(Msg, StateData) ->
     ?WARNING_MSG("unexpected message ~p", [Msg]),
-    {next_state, resume_session, StateData, hibernate}.
+    hibernate({next_state, resume_session, StateData}).
 
 
 %%----------------------------------------------------------------------
@@ -2579,7 +2582,7 @@ fsm_next_state_gc(StateName, PackedStateData) ->
 %% @doc fsm_next_state: Generate the next_state FSM tuple with different
 %% timeout, depending on the future state
 fsm_next_state(session_established, StateData) ->
-    {next_state, session_established, StateData, ?C2S_HIBERNATE_TIMEOUT};
+    maybe_hibernate({next_state, session_established, StateData});
 fsm_next_state(StateName, StateData) ->
     {next_state, StateName, StateData, ?C2S_OPEN_TIMEOUT}.
 
@@ -2587,7 +2590,7 @@ fsm_next_state(StateName, StateData) ->
 %% @doc fsm_reply: Generate the reply FSM tuple with different timeout,
 %% depending on the future state
 fsm_reply(Reply, session_established, StateData) ->
-    {reply, Reply, session_established, StateData, ?C2S_HIBERNATE_TIMEOUT};
+    maybe_hibernate({reply, Reply, session_established, StateData});
 fsm_reply(Reply, StateName, StateData) ->
     {reply, Reply, StateName, StateData, ?C2S_OPEN_TIMEOUT}.
 
@@ -3106,7 +3109,7 @@ maybe_enter_resume_session(_SMID, #state{} = SD) ->
               _TRef ->
                   SD
           end,
-    {next_state, resume_session, NSD, hibernate}.
+    hibernate({next_state, resume_session, NSD}).
 
 maybe_resume_session(NextState, El, StateData) ->
     case {xml:get_tag_attr_s(<<"xmlns">>, El),
@@ -3353,3 +3356,14 @@ setup_accum(Acc, StateData) ->
     Server = StateData#state.server,
     mongoose_acc:update(Acc, #{server => Server, user => User}).
 
+hibernate(Result) ->
+    case process_info(self(), message_queue_len) of
+        {_, 0} -> erlang:append_element(Result, hibernate);
+        _ -> Result
+    end.
+
+maybe_hibernate(Result) ->
+    case element(tuple_size(Result), Result) of
+        #state{hibernate_after = 0} -> hibernate(Result);
+        #state{hibernate_after = HA} -> erlang:append_element(Result, HA)
+    end.
